@@ -1,0 +1,171 @@
+import re
+import os
+import logging
+from datetime import datetime
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+import openpyxl
+
+# إعداد السجلات
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+HEADERS = [
+    "#",
+    "(رقم الاشتراك) MSISDN",
+    "اسم المشترك",
+    "Building code (كود البناية)",
+    "الكبينة",
+    "الكاسيت",
+    "البورت",
+    "نوع العمل",
+    "الفريق / المسؤول",
+    "التاريخ والوقت",
+    "المرسل الفعلي"
+]
+
+def get_daily_excel_filename() -> str:
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    return f"transactions_{today_str}.xlsx"
+
+def init_excel_workbook(filename: str):
+    if not os.path.exists(filename):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "جميع المعاملات"
+        ws.append(HEADERS)
+        wb.save(filename)
+
+def parse_transaction_message(text: str) -> dict:
+    patterns = {
+        "msisdn": r"MSISDN\s*:\s*([^\n]+)",
+        "name": r"Name\s*:\s*([^\n]+)",
+        "bc": r"B\.C\s*:\s*([^\n]+)",
+        "cabinet": r"Cabinet\s*:\s*([^\n]+)",
+        "caset": r"Caset\s*:\s*([^\n]+)",
+        "port": r"Port\s*:\s*([^\n]+)",
+        "type": r"Type\s*:\s*([\s\S]*?)(?=Indoor\s*:|S/N\s*:|Cabinet\s*:|Team\s*:|$)",
+        "team": r"Team\s*:\s*([^\n]+)"
+    }
+
+    data = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            val = match.group(1).strip()
+            val = re.sub(r'[\r\n]+', ' ', val)
+            data[key] = val
+        else:
+            data[key] = ""
+
+    return data
+
+def is_msisdn_exists_in_workbook(wb, msisdn_val: str) -> bool:
+    formatted_target = str(msisdn_val).strip()
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for row in ws.iter_rows(min_row=2, min_col=2, max_col=2):
+            cell_value = str(row[0].value).strip() if row[0].value else ""
+            clean_cell = cell_value.lstrip("'")
+            if clean_cell == formatted_target:
+                return True
+    return False
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text
+
+    if "MSISDN" in text.upper():
+        parsed = parse_transaction_message(text)
+        msisdn = parsed.get("msisdn", "")
+        name = parsed.get("name", "")
+
+        if not msisdn or not name:
+            await message.reply_text("⚠️ تنبيه: المعاملة غير مكتملة (يجب توفر MSISDN و Name على الأقل).")
+            return
+
+        excel_file = get_daily_excel_filename()
+        init_excel_workbook(excel_file)
+
+        wb = openpyxl.load_workbook(excel_file)
+
+        if is_msisdn_exists_in_workbook(wb, msisdn):
+            await message.reply_text(f"❌ هذه المعاملة (MSISDN: {msisdn}) مسجلة مسبقاً اليوم ولا يمكن تكرارها!")
+            return
+
+        user = message.from_user
+        sender_display_name = f"@{user.username}" if user.username else user.full_name
+
+        team_name = parsed.get("team", "").strip()
+        if not team_name:
+            team_name = sender_display_name
+
+        sheet_name = re.sub(r'[\\/*?[\]:]', '', team_name)[:31]
+
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted_msisdn = f"'{msisdn}"
+
+        row_data = [
+            0,
+            formatted_msisdn,
+            name,
+            parsed.get("bc", ""),
+            parsed.get("cabinet", ""),
+            parsed.get("caset", ""),
+            parsed.get("port", ""),
+            parsed.get("type", ""),
+            team_name,
+            current_time,
+            sender_display_name
+        ]
+
+        ws_all = wb["جميع المعاملات"]
+        row_data_all = list(row_data)
+        row_data_all[0] = ws_all.max_row
+        ws_all.append(row_data_all)
+
+        if sheet_name not in wb.sheetnames:
+            ws_team = wb.create_sheet(title=sheet_name)
+            ws_team.append(HEADERS)
+        else:
+            ws_team = wb[sheet_name]
+
+        row_data_team = list(row_data)
+        row_data_team[0] = ws_team.max_row
+        ws_team.append(row_data_team)
+
+        wb.save(excel_file)
+
+        await message.reply_text(f"✅ تم تسجيل المعاملة بنجاح (وإضافتها إلى شيت: {team_name})")
+
+async def send_daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    excel_file = get_daily_excel_filename()
+    if os.path.exists(excel_file):
+        with open(excel_file, 'rb') as f:
+            await update.message.reply_document(
+                document=f, 
+                filename=excel_file, 
+                caption=f"📊 تقرير معاملات الفايبر اليومي ليوم: {datetime.now().strftime('%Y-%m-%d')}"
+            )
+    else:
+        await update.message.reply_text("📁 لا توجد معاملات مسجلة لهذا اليوم حتى الآن.")
+
+def main():
+    TOKEN = "8261625869:AAElgxrBADM1_kcGiGji9RfO0WiRELIA9UA"
+
+    app = ApplicationBuilder().token(TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).build()
+    
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.add_handler(CommandHandler("report", send_daily_report))
+
+    print("🤖 البوت يعمل باستمرار على السيرفر المستضاف...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()
+⁠⁠
