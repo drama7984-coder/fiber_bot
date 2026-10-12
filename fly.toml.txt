@@ -1,0 +1,7 @@
+app = "fiber-telegram-bot"
+primary_region = "ams" # يمكنك اختيار أقرب منطقة (مثلاً ams لأمستردام)
+
+[build]
+
+[processes]
+  app = "python bot.py"
